@@ -1,0 +1,12 @@
+*.sql
+*.dump
+.venv
+.idea
+.git
+__pycache__
+*.pyc
+*.sql
+*.dump
+social_network_backup.sql
+*.dump
+*.csv

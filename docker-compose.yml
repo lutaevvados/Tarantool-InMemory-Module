@@ -1,0 +1,474 @@
+services:
+
+  # ============= ETCD =============
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.14
+    container_name: etcd
+    restart: always
+
+    environment:
+      ETCD_LISTEN_CLIENT_URLS: "http://0.0.0.0:2379"
+      ETCD_ADVERTISE_CLIENT_URLS: "http://etcd:2379"
+      ETCD_LISTEN_PEER_URLS: "http://0.0.0.0:2380"
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: "http://etcd:2380"
+      ETCD_INITIAL_CLUSTER: "etcd=http://etcd:2380"
+      ETCD_INITIAL_CLUSTER_STATE: "new"
+      ETCD_INITIAL_CLUSTER_TOKEN: "etcd-cluster"
+      ETCD_NAME: "etcd"
+      ETCD_ENABLE_V2: "true"
+
+    ports:
+      - "2379:2379"
+      - "2380:2380"
+
+    volumes:
+      - etcd_data:/etcd-data
+
+    networks:
+      - postgres_network
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "etcdctl",
+          "--endpoints=http://localhost:2379",
+          "endpoint",
+          "health"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+
+  # ============= PATRONI NODE 1 =============
+  patroni_node_1:
+    build:
+      context: ./postgres/patroni
+      dockerfile: Dockerfile
+
+    container_name: patroni_node_1
+    restart: always
+
+    environment:
+      PATRONI_NAME: patroni_node_1
+      PATRONI_SCOPE: social_network_cluster
+      PATRONI_ETCD_HOST: etcd:2379
+
+    ports:
+      - "5432:5432"
+      - "8008:8008"
+
+    volumes:
+      - patroni_node1_data:/var/lib/postgresql/pgdata
+
+    depends_on:
+      etcd:
+        condition: service_healthy
+
+    networks:
+      - postgres_network
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget -qO- http://localhost:8008/master || wget -qO- http://localhost:8008/replica || exit 1"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+
+  # ============= PATRONI NODE 2 =============
+  patroni_node_2:
+    build:
+      context: ./postgres/patroni
+      dockerfile: Dockerfile
+
+    container_name: patroni_node_2
+    restart: always
+
+    environment:
+      PATRONI_NAME: patroni_node_2
+      PATRONI_SCOPE: social_network_cluster
+      PATRONI_ETCD_HOST: etcd:2379
+
+    ports:
+      - "5433:5432"
+      - "8009:8008"
+
+    volumes:
+      - patroni_node2_data:/var/lib/postgresql/pgdata
+
+    depends_on:
+      etcd:
+        condition: service_healthy
+
+    networks:
+      - postgres_network
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget -qO- http://localhost:8008/master || wget -qO- http://localhost:8008/replica || exit 1"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+
+  # ============= PATRONI NODE 3 =============
+  patroni_node_3:
+    build:
+      context: ./postgres/patroni
+      dockerfile: Dockerfile
+
+    container_name: patroni_node_3
+    restart: always
+
+    environment:
+      PATRONI_NAME: patroni_node_3
+      PATRONI_SCOPE: social_network_cluster
+      PATRONI_ETCD_HOST: etcd:2379
+
+    ports:
+      - "5434:5432"
+      - "8010:8008"
+
+    volumes:
+      - patroni_node3_data:/var/lib/postgresql/pgdata
+
+    depends_on:
+      etcd:
+        condition: service_healthy
+
+    networks:
+      - postgres_network
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget -qO- http://localhost:8008/master || wget -qO- http://localhost:8008/replica || exit 1"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+
+
+  # ============= HAPROXY =============
+  haproxy:
+    build:
+      context: ./haproxy
+      dockerfile: Dockerfile
+
+    container_name: haproxy
+    restart: always
+
+    ports:
+      - "5000:5000"
+      - "5001:5001"
+      - "8404:8404"
+
+    depends_on:
+      - patroni_node_1
+      - patroni_node_2
+      - patroni_node_3
+
+    networks:
+      - postgres_network
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "nc -z 127.0.0.1 5000 && nc -z 127.0.0.1 5001"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+
+
+  # ============= CITUS COORDINATOR (диалоги) =============
+  # Coordinator принимает все запросы приложения и маршрутизирует их
+  # на нужный shard/worker автоматически.
+  citus_coordinator:
+    image: citusdata/citus:12.1
+    container_name: citus_coordinator
+    restart: always
+    ports:
+      - "5444:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_HOST_AUTH_METHOD: trust
+    volumes:
+      - citus_coordinator_data:/var/lib/postgresql/data
+    # wal_level=logical нужен для онлайн-ребалансировки шардов
+    command: postgres -c wal_level=logical -c max_replication_slots=64 -c max_wal_senders=16
+    networks:
+      - postgres_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+
+  # Первый worker — хранит часть шардов таблицы messages
+  citus_worker_1:
+    image: citusdata/citus:12.1
+    container_name: citus_worker_1
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_HOST_AUTH_METHOD: trust
+    volumes:
+      - citus_worker1_data:/var/lib/postgresql/data
+    command: postgres -c wal_level=logical -c max_replication_slots=64 -c max_wal_senders=16
+    networks:
+      - postgres_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+
+  # Второй worker — хранит другую часть шардов
+  citus_worker_2:
+    image: citusdata/citus:12.1
+    container_name: citus_worker_2
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_HOST_AUTH_METHOD: trust
+    volumes:
+      - citus_worker2_data:/var/lib/postgresql/data
+    command: postgres -c wal_level=logical -c max_replication_slots=64 -c max_wal_senders=16
+    networks:
+      - postgres_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+
+  # Третий worker — РЕЗЕРВ для демонстрации решардинга без даунтайма.
+  # НЕ регистрируется при bootstrap. Для добавления в кластер:
+  #   POST /admin/dialogs/worker/add  (регистрация)
+  #   POST /admin/dialogs/rebalance   (перенос шардов)
+  citus_worker_3:
+    image: citusdata/citus:12.1
+    container_name: citus_worker_3
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_HOST_AUTH_METHOD: trust
+    volumes:
+      - citus_worker3_data:/var/lib/postgresql/data
+    command: postgres -c wal_level=logical -c max_replication_slots=64 -c max_wal_senders=16
+    networks:
+      - postgres_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+
+  # Одноразовый контейнер: инициализирует Citus-кластер при первом запуске.
+  # Создаёт БД dialogs, регистрирует worker_1 и worker_2.
+  # После успешного выполнения завершается (restart: "no").
+  citus_bootstrap:
+    image: citusdata/citus:12.1
+    container_name: citus_bootstrap
+    depends_on:
+      citus_coordinator:
+        condition: service_healthy
+      citus_worker_1:
+        condition: service_healthy
+      citus_worker_2:
+        condition: service_healthy
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      CITUS_DB: dialogs
+      CITUS_COORDINATOR_HOST: citus_coordinator
+      CITUS_COORDINATOR_PORT: 5432
+    volumes:
+      - ./citus/bootstrap.sh:/bootstrap.sh
+    networks:
+      - postgres_network
+    restart: "no"
+    # tr -d '\r' убирает Windows-переносы строк из .sh файла
+    entrypoint: ["bash", "-c", "tr -d '\\r' < /bootstrap.sh | bash"]
+
+
+  # ============= REDIS (кэш ленты) =============
+  redis:
+    image: redis:7-alpine
+    container_name: social_redis
+    restart: always
+
+    ports:
+      - "6379:6379"
+
+    volumes:
+      - redis_data:/data
+
+    networks:
+      - postgres_network
+
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+
+  # ============= RABBITMQ (очередь сообщений и отложенная материализация) =============
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: social_rabbitmq
+    restart: always
+
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+
+    networks:
+      - postgres_network
+
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+
+  # ============= FASTAPI WEB APP =============
+  web:
+    build: .
+
+    container_name: social_web
+    restart: always
+
+    ports:
+      - "8000:8000"
+
+    environment:
+
+      POSTGRES_MASTER_HOST: haproxy
+      POSTGRES_MASTER_PORT: 5000
+
+      POSTGRES_SLAVE_HOST: haproxy
+      POSTGRES_SLAVE_PORT: 5001
+
+      POSTGRES_DB: social_network
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+
+      JWT_SECRET: dev_secret_key_12345
+
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: guest
+      RABBITMQ_PASSWORD: guest
+
+      # Параметры Tarantool In-Memory СУБД для подсистемы диалогов
+      TARANTOOL_HOST: tarantool
+      TARANTOOL_PORT: 3301
+      DIALOG_BACKEND: tarantool
+
+      # Параметры Citus coordinator для подсистемы диалогов
+      CITUS_HOST: citus_coordinator
+      CITUS_PORT: 5432
+      CITUS_DB: dialogs
+      CITUS_USER: postgres
+      CITUS_PASSWORD: postgres
+      CITUS_SHARD_COUNT: 16
+
+      # worker_3: резервный узел для демонстрации решардинга
+      CITUS_EXTRA_WORKER_HOST: citus_worker_3
+      CITUS_EXTRA_WORKER_PORT: 5432
+
+    depends_on:
+      haproxy:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      tarantool:
+        condition: service_healthy
+      citus_bootstrap:
+        condition: service_completed_successfully
+
+    networks:
+      - postgres_network
+
+
+  # ============= TARANTOOL (In-Memory СУБД с UDF для диалогов) =============
+  tarantool:
+    image: tarantool/tarantool:2.11
+    container_name: social_tarantool
+    restart: always
+
+    ports:
+      - "3301:3301"
+
+    volumes:
+      - ./tarantool/init.lua:/opt/tarantool/init.lua
+      - tarantool_data:/var/lib/tarantool
+
+    command: tarantool /opt/tarantool/init.lua
+
+    networks:
+      - postgres_network
+
+    healthcheck:
+      test: ["CMD-SHELL", "tarantoolctl eval 'return 1' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+
+
+volumes:
+  etcd_data:
+  patroni_node1_data:
+  patroni_node2_data:
+  patroni_node3_data:
+  redis_data:
+  rabbitmq_data:
+  citus_coordinator_data:
+  citus_worker1_data:
+  citus_worker2_data:
+  citus_worker3_data:
+  tarantool_data:
+
+
+
+networks:
+  postgres_network:
+    driver: bridge

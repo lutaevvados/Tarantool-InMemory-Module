@@ -1,0 +1,67 @@
+scope: social_network_cluster
+name: ${PATRONI_NAME}
+namespace: /social_network/
+
+etcd:
+  host: etcd:2379
+
+bootstrap:
+  post_init: /etc/patroni/post_init.sh
+  dcs:
+    ttl: 30
+    loop_wait: 10
+    retry_timeout: 10
+    synchronous_mode: false
+    postgresql:
+      use_pg_rewind: true
+      use_slots: true
+      parameters:
+        max_wal_senders: 10
+        max_replication_slots: 10
+        wal_level: replica
+        hot_standby: on
+        synchronous_commit: "on"
+        wal_keep_segments: 1000
+
+  initdb:
+    - encoding: UTF8
+    - locale: C
+    - data-checksums
+
+  pg_hba:
+    - local   all             all                                     trust
+    - host    replication     replicator      0.0.0.0/0               md5
+    - host    replication     all             0.0.0.0/0               md5
+    - host    all             all             127.0.0.1/32            md5
+    - host    all             all             ::1/128                 md5
+    - host    all             all             0.0.0.0/0               md5
+
+postgresql:
+  data_dir: /var/lib/postgresql/pgdata
+  pgpass: /tmp/pgpass
+  listen: "0.0.0.0:5432"
+  connect_address: "${PATRONI_NAME}:5432"
+  
+  authentication:
+    superuser:
+      username: postgres
+      password: postgres
+    replication:
+      username: replicator
+      password: replicator
+
+  parameters:
+    max_wal_senders: 10
+    max_replication_slots: 10
+    wal_level: replica
+    hot_standby: on
+    synchronous_commit: "on"
+    shared_buffers: 256MB
+    wal_buffers: 16MB
+    tcp_keepalives_idle: 30
+    tcp_keepalives_interval: 10
+    tcp_keepalives_count: 3
+
+restapi:
+  listen: "0.0.0.0:8008"
+  connect_address: "${PATRONI_NAME}:8008"
